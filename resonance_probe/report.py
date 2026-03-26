@@ -4,6 +4,37 @@ from pathlib import Path
 
 
 def build_markdown_report(results: dict) -> str:
+    if results.get("mode") == "batch":
+        agg = results["aggregate"]
+        lines = [
+            "# Resonance probe batch report",
+            "",
+            "## Run",
+            "",
+            f"- tool: `{results['tool']}` `{results['version']}`",
+            f"- model type: `{results['model_type']}`",
+            f"- resonance repo: `{results['resonance_repo']}`",
+            f"- checkpoint: `{results['checkpoint'] or 'none'}`",
+            f"- wav dir: `{results['wav_dir']}`",
+            f"- files: `{agg['num_files']}`",
+            "",
+            "## Aggregate metrics",
+            "",
+            f"- mean MSE: `{agg['mean_mse']:.6f}`",
+            f"- mean SNR (dB): `{agg['mean_snr_db']:.6f}`",
+            f"- mean byte accuracy: `{agg['mean_byte_accuracy']:.6f}`",
+            f"- mean top-5 byte accuracy: `{agg['mean_top_5_accuracy']:.6f}`",
+            f"- mean within/cross error ratio: `{agg['mean_within_to_cross_ratio']:.6f}`",
+            f"- mean processed isotropy: `{agg['mean_processed_isotropy']:.6f}`",
+            f"- mean processed curvature: `{agg['mean_processed_curvature']:.6f}`",
+            "",
+            "## Interpretation",
+            "",
+            "This is an aggregate summary over a directory of WAV files.",
+            "Per-file metrics remain available in the JSON artifact under `per_file`.",
+        ]
+        return "\n".join(lines) + "\n"
+
     byte_probe = results["byte_probe"]
     geom = results["geometry_probe"]
 

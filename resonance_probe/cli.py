@@ -21,6 +21,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-type", choices=["oscillator", "causal"], default="oscillator")
     parser.add_argument("--checkpoint", type=Path, default=None)
     parser.add_argument("--wav", type=Path, default=None)
+    parser.add_argument("--input-wav", type=Path, default=None)
+    parser.add_argument("--target-wav", type=Path, default=None)
+    parser.add_argument("--wav-dir", type=Path, default=None)
     parser.add_argument("--sample-rate", type=int, default=16000)
     parser.add_argument("--n-oscillators", type=int, default=32)
     parser.add_argument("--n-layers", type=int, default=2)
@@ -36,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--output", type=Path, default=Path("results/resonance_probe.json"))
     parser.add_argument("--report-md", type=Path, default=None)
+    parser.add_argument("--save-audio-dir", type=Path, default=None)
     return parser
 
 
@@ -49,13 +53,24 @@ def main() -> None:
         write_markdown_report(args.report_md, results)
         logger.info("Saved Markdown report to %s", args.report_md)
 
-    logger.info(
-        "summary: snr=%.4f dB byte_acc=%.6f top5=%.6f proc_iso=%.6f",
-        results["snr_db"],
-        results["byte_probe"]["byte_accuracy"],
-        results["byte_probe"]["topk_accuracy"]["top_5"],
-        results["geometry_probe"]["processed_isotropy"],
-    )
+    if results.get("mode") == "batch":
+        agg = results["aggregate"]
+        logger.info(
+            "batch summary: files=%d mean_snr=%.4f dB mean_byte_acc=%.6f mean_top5=%.6f mean_proc_iso=%.6f",
+            agg["num_files"],
+            agg["mean_snr_db"],
+            agg["mean_byte_accuracy"],
+            agg["mean_top_5_accuracy"],
+            agg["mean_processed_isotropy"],
+        )
+    else:
+        logger.info(
+            "summary: snr=%.4f dB byte_acc=%.6f top5=%.6f proc_iso=%.6f",
+            results["snr_db"],
+            results["byte_probe"]["byte_accuracy"],
+            results["byte_probe"]["topk_accuracy"]["top_5"],
+            results["geometry_probe"]["processed_isotropy"],
+        )
 
 
 if __name__ == "__main__":

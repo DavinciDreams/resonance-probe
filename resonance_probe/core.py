@@ -16,6 +16,17 @@ import torch.nn.functional as F
 logger = logging.getLogger(__name__)
 
 
+def save_wav(path: Path, signal: torch.Tensor, sample_rate: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    signal = signal.detach().float().clamp(-1.0, 1.0).cpu()
+    pcm = (signal * 32767.0).round().short().tolist()
+    with wave.open(str(path), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(sample_rate)
+        f.writeframes(struct.pack(f"<{len(pcm)}h", *pcm))
+
+
 def load_module(module_name: str, path: Path):
     spec = importlib.util.spec_from_file_location(module_name, path)
     module = importlib.util.module_from_spec(spec)
@@ -391,39 +402,66 @@ def auto_device(device_name: str) -> torch.device:
     return torch.device("cpu")
 
 
-def run_probe(args) -> dict[str, Any]:
-    device = auto_device(args.device)
-    torch.manual_seed(args.seed)
-    logger.info("Device=%s model_type=%s repo=%s", device, args.model_type, args.resonance_repo)
+def summarize_results(results: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "params": results["params"],
+        "mse": results["mse"],
+        "snr_db": results["snr_db"],
+        "byte_accuracy": results["byte_probe"]["byte_accuracy"],
+        "top_5_accuracy": results["byte_probe"]["topk_accuracy"]["top_5"],
+        "within_to_cross_ratio": results["byte_probe"]["error_analysis"]["within_to_cross_ratio"],
+        "processed_intrinsic_dim": results["geometry_probe"]["processed_intrinsic_dim"],
+        "processed_isotropy": results["geometry_probe"]["processed_isotropy"],
+        "processed_curvature": results["geometry_probe"]["processed_curvature"],
+    }
 
-    model = load_resonance_model(
-        repo_path=args.resonance_repo,
-        model_type=args.model_type,
-        checkpoint=args.checkpoint,
-        device=device,
-        n_oscillators=args.n_oscillators,
-        n_layers=args.n_layers,
-        n_heads=args.n_heads,
-        sample_rate=args.sample_rate,
-        hop=args.hop,
-    )
 
-    train_metrics = quick_train(
-        model,
-        args.model_type,
-        steps=args.quick_train_steps,
-        batch_size=args.train_batch_size,
-        length=args.train_length,
-        sample_rate=args.sample_rate,
-        device=device,
-    )
+def mean_metric(items: list[dict[str, Any]], key: str) -> float:
+    vals = [float(item[key]) for item in items]
+    return sum(vals) / max(len(vals), 1)
 
-    if args.wav:
-        target_wave, sr = load_wav(args.wav)
-        target_wave = resample_linear(target_wave, sr, args.sample_rate)
-        target_wave = target_wave[: args.eval_length]
-        input_wave = target_wave.clone()
-        eval_source = "wav"
+
+def aggregate_batch_results(per_file: list[dict[str, Any]]) -> dict[str, Any]:
+    summaries = [summarize_results(item) for item in per_file]
+    return {
+        "num_files": len(per_file),
+        "mean_mse": mean_metric(summaries, "mse"),
+        "mean_snr_db": mean_metric(summaries, "snr_db"),
+        "mean_byte_accuracy": mean_metric(summaries, "byte_accuracy"),
+        "mean_top_5_accuracy": mean_metric(summaries, "top_5_accuracy"),
+        "mean_within_to_cross_ratio": mean_metric(summaries, "within_to_cross_ratio"),
+        "mean_processed_isotropy": mean_metric(summaries, "processed_isotropy"),
+        "mean_processed_curvature": mean_metric(summaries, "processed_curvature"),
+    }
+
+
+def run_single_probe(args, model, device: torch.device, sample_name: str = "sample") -> dict[str, Any]:
+    if getattr(args, "_skip_training", False):
+        train_metrics = {}
+    else:
+        train_metrics = quick_train(
+            model,
+            args.model_type,
+            steps=args.quick_train_steps,
+            batch_size=args.train_batch_size,
+            length=args.train_length,
+            sample_rate=args.sample_rate,
+            device=device,
+        )
+
+    if args.input_wav or args.target_wav or args.wav:
+        input_path = args.input_wav or args.wav
+        target_path = args.target_wav or args.wav or input_path
+        if input_path is None or target_path is None:
+            raise ValueError("WAV evaluation needs either --wav or both --input-wav and --target-wav")
+        input_wave, input_sr = load_wav(input_path)
+        target_wave, target_sr = load_wav(target_path)
+        input_wave = resample_linear(input_wave, input_sr, args.sample_rate)[: args.eval_length]
+        target_wave = resample_linear(target_wave, target_sr, args.sample_rate)[: args.eval_length]
+        min_len = min(input_wave.numel(), target_wave.numel())
+        input_wave = input_wave[:min_len]
+        target_wave = target_wave[:min_len]
+        eval_source = "wav_pair" if args.input_wav or args.target_wav else "wav"
     else:
         clean, noisy = make_vowel(1, args.eval_length, args.sample_rate, device)
         target_wave = clean[0].detach().cpu()
@@ -453,13 +491,22 @@ def run_probe(args) -> dict[str, Any]:
     snr_db = float(10.0 * math.log10(max(snr_num, 1e-10) / snr_den))
     params = int(sum(p.numel() for p in model.parameters()))
 
+    if args.save_audio_dir:
+        sample_dir = args.save_audio_dir / sample_name
+        save_wav(sample_dir / "input.wav", input_wave, args.sample_rate)
+        save_wav(sample_dir / "target.wav", target_wave, args.sample_rate)
+        save_wav(sample_dir / "prediction.wav", pred_wave, args.sample_rate)
+
     return {
         "tool": "resonance-probe",
         "version": "0.1.0",
+        "sample_name": sample_name,
         "model_type": args.model_type,
         "resonance_repo": str(args.resonance_repo),
         "checkpoint": str(args.checkpoint) if args.checkpoint else "",
         "wav": str(args.wav) if args.wav else "",
+        "input_wav": str(args.input_wav) if args.input_wav else "",
+        "target_wav": str(args.target_wav) if args.target_wav else "",
         "eval_source": eval_source,
         "params": params,
         "sample_rate": args.sample_rate,
@@ -471,6 +518,56 @@ def run_probe(args) -> dict[str, Any]:
         "geometry_probe": geom,
         "train_metrics": train_metrics,
     }
+
+
+def run_probe(args) -> dict[str, Any]:
+    device = auto_device(args.device)
+    torch.manual_seed(args.seed)
+    logger.info("Device=%s model_type=%s repo=%s", device, args.model_type, args.resonance_repo)
+    model = load_resonance_model(
+        repo_path=args.resonance_repo,
+        model_type=args.model_type,
+        checkpoint=args.checkpoint,
+        device=device,
+        n_oscillators=args.n_oscillators,
+        n_layers=args.n_layers,
+        n_heads=args.n_heads,
+        sample_rate=args.sample_rate,
+        hop=args.hop,
+    )
+
+    if args.wav_dir:
+        wav_paths = sorted(path for path in args.wav_dir.iterdir() if path.suffix.lower() == ".wav")
+        if not wav_paths:
+            raise ValueError(f"No .wav files found in {args.wav_dir}")
+
+        per_file = []
+        for idx, wav_path in enumerate(wav_paths):
+            logger.info("batch item %d/%d: %s", idx + 1, len(wav_paths), wav_path.name)
+            args.wav = wav_path
+            args.input_wav = None
+            args.target_wav = None
+            args._skip_training = idx > 0
+            result = run_single_probe(args, model, device, sample_name=wav_path.stem)
+            per_file.append(result)
+
+        return {
+            "tool": "resonance-probe",
+            "version": "0.1.0",
+            "mode": "batch",
+            "model_type": args.model_type,
+            "resonance_repo": str(args.resonance_repo),
+            "checkpoint": str(args.checkpoint) if args.checkpoint else "",
+            "wav_dir": str(args.wav_dir),
+            "sample_rate": args.sample_rate,
+            "hop": args.hop,
+            "quick_train_steps": args.quick_train_steps,
+            "aggregate": aggregate_batch_results(per_file),
+            "per_file": per_file,
+        }
+
+    args._skip_training = False
+    return run_single_probe(args, model, device)
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
